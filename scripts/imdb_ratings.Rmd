@@ -1,0 +1,450 @@
+---
+title: "Predicting IMDB Ratings"
+author: "Ryan Heslin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+The data here concern about 80,000 movies on www.imdb.com. I'm interested
+in predicting the number of user reviews a movie receives. Several features,
+such as year of release, language, and genre seem promising. Unfortunately, the
+data are ridden with NA's I can't reasonably impute.
+
+# EDA and Processing
+```{r, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+knitr::opts_chunk$set(comment =  "", fig.pos = "center")
+
+ratings_raw <- read_csv("../data/imdb/IMDb movies.csv")
+
+head(ratings_raw)
+```
+
+My custom `ggplot` theme.
+```{r}
+my_theme <- function() 
+{
+    theme_standard <- ggplot2::theme(panel.background = element_blank(), 
+        panel.border = element_rect(color = "black", fill = NA), 
+        panel.grid = element_blank(), panel.grid.major.x = element_line(color = "gray93"), 
+        legend.background = element_rect(fill = "gray93"), 
+        plot.title = element_text(size = 15, family = "sans", 
+            face = "bold", vjust = 1.3), plot.title.position = "plot", 
+        plot.subtitle = element_text(size = 10, family = "sans"), 
+        legend.title = element_text(size = 10, family = "sans", 
+            face = "bold"), axis.title = element_text(size = 9, 
+            family = "sans", face = "bold"), axis.text = element_text(size = 8, 
+            family = "sans"), strip.background = element_rect(color = "black", 
+            fill = "black"), strip.text.x = element_text(color = "white"), 
+        strip.text.y = element_text(color = "white"))
+    ggplot2::theme_set(theme_standard)
+}
+my_theme()
+```
+
+One problem crops up immediately: many movie budgets are given in units of foreign currency. Simply converting
+to numeric would give misleading values. I decide to just NA them for now.
+```{r}
+
+ratings_raw %>% filter(if_any(c(budget, ends_with("income")), ~str_detect(.x, "^[^[$\\d]]") & !is.na(.x)))
+
+ratings <- select(ratings_raw, -2) %>%
+  rename(title = "original_title") %>%
+  mutate(across(c(budget, ends_with("income")), ~ if_else(str_detect(.x, "^[^[$\\d]]"), NA_character_, str_remove(.x, "^\\$")) %>% as.numeric())) %>% 
+   replace_na(list(reviews_from_critics = 0))
+```
+
+Several variables with multiple values, such as genre, are given as comma-
+separated strings. I define a function to unchop them.
+```{r}
+separate_rows2 <- function(df, sep = "[^[:alnum:].]+", ...){
+  cols = rlang::ensyms(...)
+  purrr::reduce(cols, ~separate_rows(.x, !!.y, sep = sep), .init = df)
+}
+ratings_unchopped <- ratings %>% 
+  separate_rows2(sep = "[,]\\s", country, genre, language)
+```
+
+Metascore is a promising predictor, but is missing for most observations. Only
+`r sum(complete.cases(ratings))` do not have at least one NA. 
+
+I don't think any can be reasonably imputed, since in most cases the value is
+truly nonexistent (e.g., a movie with no metascore).
+```{r}
+colSums(is.na(ratings))
+```
+
+## Reponse
+Some elementary EDA. User reviews has extreme positive skew, with a handful
+of movies with very many reviews.
+```{r}
+ratings %>% ggplot(aes(x =reviews_from_users)) +
+  geom_density()
+
+ratings %>% ggplot(aes(x = avg_vote)) + 
+  geom_density()
+
+ratings %>% slice_max(n = 25, order_by = reviews_from_users) %>% 
+  select(title, worlwide_gross_income, genre, reviews_from_users)
+```
+
+## Metascore
+
+The correlation between metascore and mean rating is consistent across genres.
+```{r}
+
+no_meta_genres <- c("Adult", "Documentary", "News", "Reality", "Reality-TV",
+                    "TV" )
+ratings %>% 
+  separate_rows(sep = "[,]\\s", genre) %>% 
+  filter(!genre %in% no_meta_genres) %>% 
+  ggplot(aes(x = metascore, y = avg_vote)) +
+  geom_smooth(method = "lm", col = "green") +
+  geom_jitter(alpha = .1, color = "red", stroke = .1, shape = 21) +
+  facet_wrap(genre ~ .)
+
+```
+
+There is still pronounced positive skew even after logging. A few genres have 
+only a handful of instances.
+```{r}
+ratings_unchopped %>% 
+  ggplot(aes(x =  reviews_from_users^.2, fill = genre)) +
+  geom_histogram(show.legend = FALSE, bins = 50) +
+  scale_x_continuous(labels = function(x) x^5)+
+  facet_wrap(. ~ genre, scales = "free_y") 
+  
+```
+
+
+## Country and Language
+Unsurprisingly, the most reviews for each genre go to US and English-language
+movies.
+```{r}
+by_genre <- ratings_unchopped %>% group_by(genre) %>%
+  distinct(title, .keep_all = TRUE) %>% 
+  slice_max(n=10, order_by = reviews_from_users) %>% 
+  ungroup()
+
+head(by_genre)
+
+fct_count(by_genre$language, sort = TRUE)
+fct_count(by_genre$country, sort = TRUE)
+```
+
+## Director
+
+The directors with the highest sums of average rating worked mostly
+in Golden Age Hollywood - makes sense, as they made many well-received movies.
+```{r}
+
+ratings %>% count(director, wt = avg_vote) %>% 
+arrange(-n)
+
+```
+
+US and English-language movies are not surprisingly predominant.
+```{r}
+aggs <- ratings %>% select(title, country, genre, language) %>% 
+  separate_rows2(sep = "[,]\\s", country, genre) %>%  
+  select(-title) %>% 
+  map(table, exclude = list(NA)) %>% 
+  map(sort, decreasing = TRUE)
+
+map(aggs, head)
+```
+
+## Number of Votes and Critic Reviews
+
+reviews_from_users unsurprisingly has strong correlations with number of votes.
+and number of critic's reviews. Metascore, interestingly, has almost no correlation.
+```{r}
+ratings %>% select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  apply(MARGIN = 1, rev) %>%
+  {
+    image(
+      z = .,
+      xlab = paste(dimnames(.)[[2]], collapse = " "),
+      ylab = paste(dimnames(.)[[1]], collapse = " "),
+      cex.lab = .65
+    )
+  }
+```
+
+Interestingly, the movies with the highest ratios of user to critic reviews 
+mostly come from India. IMDB probably undersamples reviews in the foreign-language
+press, but Indian users are under no such restriction.
+```{r}
+ratings %>% filter(reviews_from_critics >0) %>% 
+  arrange(-(reviews_from_users / reviews_from_critics))
+```
+
+## Gross
+
+Budget and domestic and foreign gross all have decent correlations with number 
+of reviews, which makes sense.
+```{r}
+ratings  %>% 
+  select(where(is.numeric)) %>% cor(use = "pairwise.complete.obs")
+```
+
+More recent movies naturally have far more reviews, with what looks 
+like a big jump around the start of the 1990s, when the current generation of
+Internet users was born. the median number of reviews, however, is more consistent,
+suggesting some recent outliers.
+```{r}
+by_year <- ratings %>% group_by(year) %>% 
+  summarize(across(reviews_from_users, .fns = map(list(mean = mean, median = median, sd = sd, sum = sum), ~partial(.x, na.rm = TRUE))))
+tail(by_year, n = 10)
+
+by_year %>% pivot_longer(cols = -year, names_to = "Variable", values_to = "Value") %>%
+  mutate(Variable = str_extract(Variable,"([^_]+)$")) %>% 
+  ggplot(aes(x = year, y = Value, fill = Variable)) +
+  stat_smooth(geom = "area", method = "loess", span = .3, alpha = .6, outline.type = "full" , position = position_stack(), col = "black") +
+  facet_wrap(. ~ Variable, scales = "free_y")
+```
+
+Hilariously, the language with the highest average rating is Quenya,
+one of the two elven languages in _Lord of the Rings_. Sindarin's not far behind.
+
+This illustrates the general pattern: the highest average ratings
+correspond to small countries and obscure languages because those correspond to 
+only a few films with small but devoted fanbases. English is only about 5.72, 
+by contrast.
+```{r, cache = TRUE}
+
+ratings_unchopped %>% 
+  {
+    map2(
+      replicate(3, ., simplify = FALSE),
+      alist(genre, country, language),
+      ~ group_by(.x, !!.y)
+    )
+  } %>%
+  map( ~ summarize(.x, across(
+    c(avg_vote, metascore, reviews_from_users, reviews_from_critics),
+    mean,
+    na.rm = TRUE
+  ))) %>%
+  map( ~ arrange(.x, -avg_vote))
+
+```
+
+This section reflects an abandoned attempt to compute individual genre means. I
+ended up finding a different approach.
+<!-- Since movies have up to 3 genres, I compute the average user reviews for each -->
+<!-- genre separately, then take the mean of the separate genre means. -->
+<!-- # ```{r} -->
+<!-- # means <- ratings_unchopped %>% -->
+<!-- #   filter(!genre %in% no_meta_genres) %>% -->
+<!-- #   group_by(genre) %>% -->
+<!-- #   summarize(imdb_title_id, genre_mean = mean(reviews_from_users, na.rm = TRUE), .groups = "drop") -->
+<!-- # -->
+<!-- # col_names <- paste("genre", 1:10, "mean", sep = "_") -->
+<!-- # -->
+<!-- # ratings <- left_join(ratings_unchopped %>% filter(!genre %in% no_meta_genres), means, by = c(genre = "genre", imdb_title_id = "imdb_title_id")) %>% -->
+<!-- #   distinct(imdb_title_id, genre, .keep_all = TRUE) %>% -->
+<!-- #   group_by(imdb_title_id) %>% -->
+<!-- #   mutate(genre2 = sort(genre), -->
+<!-- #          genre2 = col_names[1:n()]) %>% -->
+<!-- #   ungroup() %>% -->
+<!-- #   pivot_wider(names_from = genre2, values_from = genre_mean) %>% -->
+<!-- #   rowwise() %>% -->
+<!-- #   mutate(gen_mean = mean(c_across(ends_with("mean")), na.rm= TRUE)) %>% -->
+<!-- #   ungroup() -->
+<!-- # -->
+<!-- # ``` -->
+
+I clean up the data, dropping NA's and log-trainsforming.
+```{r}
+
+ratings_cleaned <-
+  ratings %>% filter(if_all(
+    c(language,
+      genre,
+      worlwide_gross_income,
+      reviews_from_critics,
+      reviews_from_users,
+      year),
+    ~ !is.na(.)
+  )) %>%
+  mutate(reviews_from_users = log10(reviews_from_users))
+```
+
+I compute genre-specific means by taking the difference of the overall mean and
+the mean of all movies in that genre (in log units). I will add these centered
+means diretcly to the predicted values.
+```{r}
+
+genres <- unique(ratings_unchopped$genre)  %>% 
+  setdiff(no_meta_genres) 
+
+mu <- ratings_cleaned %>% 
+  pull(reviews_from_users) %>% 
+  mean()
+
+means <- ratings_cleaned %>%
+  separate_rows(genre, sep = "[,]\\s") %>% 
+  filter(!genre %in% no_meta_genres) %>% 
+  group_by(genre) %>% 
+  summarize(genre_mean = mean(reviews_from_users, na.rm = TRUE), .groups = "drop") %>% 
+  {setNames(.$genre_mean, .$genre)}
+
+means <- means  - mu
+
+adj_means <- ratings_cleaned %>% 
+  separate_rows(genre, sep = "[,]\\s") %>% 
+  mutate(!!!setNames(as.list(rep(0, length(genres))), nm = genres),
+                             across(genres, ~if_else(genre == cur_column(), means[[cur_column()]], 0))) %>% 
+  group_by(imdb_title_id) %>% 
+  summarize(imdb_title_id =unique(imdb_title_id), across(genres, sum))
+```
+
+I condense langauge into a binary "English/Other" factor, since that seems
+the most important pattern.
+```{r}
+ratings_cleaned <- ratings_cleaned %>% mutate(language = factor(if_else(str_detect(language, "^English"), "English", "Other"))) %>% 
+  left_join(., adj_means %>% select(imdb_title_id, matches("^[A-Z]", ignore.case = FALSE)), by = "imdb_title_id")
+  
+```
+
+I remove NA's and partition the data.
+```{r}
+set.seed(1996)
+
+inds <-
+  sample(1:nrow(ratings_cleaned), nrow(ratings_cleaned)  %/% 5)
+ratings_train <- ratings_cleaned[inds,]
+ratings_test <- ratings_cleaned[-inds,]
+
+```
+# Modeling
+
+I create the recipe.
+```{r}
+
+dummies <- ratings_train %>% 
+  select(genres) %>% 
+  rowSums()
+
+lm_rec <-
+  recipe(
+    formula = reviews_from_users ~ year + language +
+      worlwide_gross_income + reviews_from_critics, data = ratings_train
+  ) %>% 
+  step_log(worlwide_gross_income, base = 10)
+
+lm_rec <- prep(lm_rec, training = ratings_train, retain = TRUE)
+
+```
+
+I fit the initial model.
+```{r}
+lm_wflow <- workflow() %>% 
+  add_model(linear_reg() %>% set_engine("lm")) %>% 
+  add_recipe(lm_rec)
+
+lm_fit <- fit(lm_wflow, ratings_train)
+lm_fit
+
+tidy(lm_fit)
+```
+
+The models seems to struggle at both ends of the distribution, overpredicting
+movies with few review and underpredicting those with many.
+```{r}
+
+tibble(Predicted = predict(lm_fit, new_data = ratings_train)[[1]] + dummies, Actual = ratings_train$reviews_from_users) %>% 
+  ggplot(aes(x = Predicted, y = Actual)) +
+  geom_jitter(alpha = .3) +
+  geom_abline() +
+  coord_fixed()
+```
+
+I decide to try transforming year with a spline function toa ccount for the
+non-constant slope.
+```{r}
+lm_rec <-
+  recipe(
+    reviews_from_users ~ year + language +
+      worlwide_gross_income + reviews_from_critics, data = ratings_train
+  ) %>% 
+  step_log(worlwide_gross_income, base = 10) %>% 
+  step_ns(year, deg_free = tune("year_df"))
+
+params <- lm_rec    %>% 
+  parameters() %>% 
+  update(`year_df` = spline_degree())
+
+```
+
+I K-fold the training data and create a training grid.
+```{r}
+splits <- vfold_cv(ratings_train)
+
+tuning_grid <- grid_max_entropy(params, size = 10)
+
+lm_mod <- linear_reg() %>% set_engine("lm")
+```
+
+Different degrees of freedom don't make much difference. I decide to settle
+on 4.
+```{r}
+tuned <- tune_grid(lm_mod, lm_rec, resamples = splits, grid = tuning_grid )
+
+tuned %>% collect_metrics() 
+
+autoplot(tuned, metric = "rmse")
+
+```
+
+I fit the updated model.
+```{r}
+
+lm_rec <-
+  recipe(
+    reviews_from_users ~ year  + language +
+      worlwide_gross_income + reviews_from_critics, data = ratings_train
+  ) %>% 
+  step_log(worlwide_gross_income, base = 10) %>% 
+  step_ns(year, deg_free = 4)
+
+lm_wflow <- workflow() %>% 
+  add_model(linear_reg() %>% set_engine("lm")) %>% 
+  add_recipe(lm_rec)
+
+lm_fit2 <- fit(lm_wflow, ratings_train)
+```
+
+The pattern remains about the same.
+```{r}
+tibble(Predicted = predict(lm_fit2, new_data = ratings_train)[[1]] + dummies, Actual = ratings_train$reviews_from_users) %>% 
+  ggplot(aes(x = Predicted, y = Actual)) +
+  geom_jitter(alpha = .3) +
+  geom_abline() +
+  scale_x_continuous(breaks = 0:10) +
+  scale_y_continuous(breaks = 0:10)
+```
+Our RMSE (converting back from log-10 units) is about .44, which isn't too bad.
+I drop the genre-sepcific means, because they considerably worsen the RMSE.
+```{r}
+
+mets <- metric_set(rmse, rsq)
+mets(predict(lm_fit2, new_data = ratings_train), truth = ratings_train$reviews_from_users, estimate = .pred + dummies )
+
+mets(predict(lm_fit2, new_data = ratings_train), truth = ratings_train$reviews_from_users, estimate = .pred)
+```
+
+Remarkably, RMSE is almost the same after fitting on the test set.
+```{r}
+
+mets(predict(lm_fit2, new_data = ratings_test), truth = ratings_test$reviews_from_users, estimate = .pred)
+```
+
+An overview of the model. It seems most of the effect comes from language.
+```{r}
+tidy(lm_fit2)
+```
+
