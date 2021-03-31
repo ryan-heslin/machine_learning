@@ -2,3 +2,5 @@
 .Rhistory
 .RData
 .Ruserdata
+data/archive.zip
+data/imdb/IMDb movies.csv
