@@ -1,0 +1,344 @@
+---
+title: "Predicting Phishing with Cluster Analysis"
+author: "Ryan Heslin"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: 
+  pdf_document:
+    highlight: "kate"
+    df_print: "kable"
+---
+
+ <!-- Standard custom LaTeX commands -->
+\newcommand{\abcd}{\begin{bmatrix}a&b\\
+c&d\end{bmatrix}}
+\newcommand{\m}[1]{\begin{bmatrix}#1\end{bmatrix}}
+
+\newcommand{\vect}[1]{\begin{pmatrix}#1\end{pmatrix}}
+
+\newcommand{\meq}[1]{\begin{split}#1\end{split}}
+
+\newcommand{\bym}[1]{#1\times{m}}
+
+\newcommand{\nby}[1]{n\times{#1}}
+
+\newcommand{\subsp}[2]{\Bigg\{\begin{bmatrix}#1\end{bmatrix}:#2\Bigg\}}
+
+\newcommand{\proj}[2]{\text{proj}_#1(#2)}
+
+\newcommand{\refl}[2]{\text{refl}_#1(#2)}
+
+\newcommand{\sumn}{\sum_{i=1}^n}
+
+<!-- % 1: term 1 -->
+<!-- % 2: subscript 1 -->
+<!-- % 3: term 2 -->
+<!-- % 4: subscript 2 -->
+<!-- % 5. operation -->
+\newcommand{\dotsn}[5]{#1_{1}#3_{1}#5{#1}_{2}#3_{2}{#5}\dots{#5}#1_{#2}#3_{#4}}
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(rlang)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = "",
+  fig.pos = "",
+  warning = FALSE,
+  tidy = TRUE,
+  fig.align = "center",
+  highlight = TRUE
+)
+theme_standard <- ggplot2::theme(panel.background = element_blank(), 
+        panel.border = element_rect(color = "black", fill = NA), 
+        panel.grid = element_blank(), panel.grid.major.x = element_line(color = "gray93"), 
+        legend.background = element_rect(fill = "gray93"), 
+        plot.title = element_text(size = 15, family = "sans", 
+            face = "bold", vjust = 1.3), plot.title.position = "plot", 
+        plot.subtitle = element_text(size = 10, family = "sans"), 
+        legend.title = element_text(size = 10, family = "sans", 
+            face = "bold"), axis.title = element_text(size = 9, 
+            family = "sans", face = "bold"), axis.text = element_text(size = 8, 
+            family = "sans"), strip.background = element_rect(color = "black", 
+            fill = "black"), strip.text.x = element_text(color = "white"), 
+        strip.text.y = element_text(color = "white"))
+    ggplot2::theme_set(theme_standard)
+    
+
+```
+
+Today I use clustering to develop a model to classify phishing websites. Phishing sites masquerade as legitimate websites and try to trick visitors into
+revealing personal information such as credit card numbers. 
+
+The dataset, and a data dictionary, may be found at
+http://archive.ics.uci.edu/ml/datasets/Phishing+Websites#. It consists of
+several dozen features related to a sample of 5000 legitimate and 5000
+phishing URLS. Most features are 2- or 3-level categories.
+```{r}
+raw <- read_csv("../data/Phishing_Legitimate_full.csv")
+raw %>% 
+  select(1:6, last_col()) %>% 
+  head()
+sapply(raw[,-1], summary) %>% 
+  t() %>%
+  as.data.frame() %>% 
+  rownames_to_column(var = "Variable")  
+```
+
+\pagebreak
+All classes seem well dispersed. I convert the indicator variables to factors and drop one that's all zeroes. Then I arrange the factors by difference in 
+proportions. Some features are exceptionally rare.
+```{r}
+is_one_hot <- function(x){
+  identical(sort(unique(x)), c(0, 1))
+}  
+# drop useless column
+cleaned <- raw %>% select(where(~n_distinct(.x) >1)) %>% 
+  mutate(across(where(~is_one_hot(.x)), ~factor(.x, levels = c(0, 1), labels = c("no", "yes"))),
+         across(where(~identical(sort(unique(.x)), c(-1, 0, 1))), ~factor(.x, labels = c("phish", "suspicious", "legitimate"))))
+
+facs <- cleaned %>% select(where(~is.factor(.x) && nlevels(.x) ==2)) %>%  map(~fct_count(.x, prop = TRUE)) %>% 
+  bind_rows(.id = "Variable")
+
+facs %>% group_by(Variable) %>% 
+  summarize(Range = abs(diff(p))) %>% 
+arrange(-Range)
+```
+\pagebreak
+A few components capture almost all the variation, though treating dummy variables as quantitative for the purposes of PCA is a crude approach.
+
+PC 1 scores fall after observation 8000. That suggests the ordering of observations is nonrandom, but sampling test and training sets will fix that.
+
+Only a few components are necessary.
+```{r}
+pca <- raw %>% select(-c("id", "HttpsInHostname", "CLASS_LABEL")) %>%
+  princomp( scale. = TRUE)
+
+summary(pca)
+tibble(obs = 1:nrow(raw), score = pca$scores[,1]) %>% 
+  ggplot(aes(x = obs, y = score )) +geom_col(fill = "red")
+```
+\pagebreak
+Only a few loadings are high for both of the first two components.
+```{r}
+as_tibble(pca$scores[, 1:2]) %>% mutate(class = cleaned$CLASS_LABEL) %>%
+  ggplot(aes(x = Comp.1, y = Comp.2, color = class)) + geom_jitter(alpha = .1) + geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0)
+
+as_tibble(pca$loadings[, 1:2], rownames = "variable")  %>% 
+  ggplot(aes(
+    x = Comp.1,
+    y = Comp.2,
+    label = variable
+  )) +
+  geom_point(aes(color = abs(Comp.1 + Comp.2))) +
+  scale_color_gradient(low = "blue", high = "red") +
+  ggrepel::geom_text_repel() +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0)
+```
+
+An FAMD analysis, which combines PCA on quantitative variables with MCA on factors, fails to extract much variance in the first few factors. We need to reduce the number of variables.
+```{r, message = FALSE}
+library(FactoMineR)
+library(factoextra)
+set.seed(555)
+
+train_i <- sample(1:nrow(cleaned), nrow(cleaned)/5, replace = FALSE)
+famd <- FAMD(mutate(cleaned[train_i,-c(1, ncol(cleaned))], across(where(is.numeric), scale)))
+
+fviz_screeplot(famd)
+```
+\pagebreak
+It's hard to discern a pattern by comparing factor scores for the variables.
+```{r}
+as_tibble(famd$var$coord, rownames = "variable") %>% 
+  ggplot(aes(x = Dim.1, y = Dim.2)) +
+  geom_point(aes(color = abs(Dim.1 + Dim.2))) +
+  scale_color_gradient(low = "blue", high = "red") +
+  ggrepel::geom_text_repel(aes(label = variable)) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0)
+
+```
+\pagebreak
+Still, it seems phishing sites score a little higher on factor 2 than
+legitimate sites.
+```{r}
+as_tibble(famd$ind$coord[,1:2]) %>% mutate(class = cleaned$CLASS_LABEL[train_i]) %>%
+  ggplot(aes(x = Dim.1, y = Dim.2, color = class)) + geom_jitter(alpha = .1) + geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0)
+```
+We seem to have narrowed down a set of URL features associated with phishing.
+```{r}
+famd$var$cos2 %>%
+  as_tibble(rownames = "variable") %>% 
+  select(1:3) %>% 
+  arrange(-(Dim.1 + Dim.2)) %>% 
+  head()
+```
+```{r}
+as_tibble(famd$var$contrib[,1:2], rownames = "variable") %>% 
+  arrange(-pmax(Dim.1, Dim.2)) %>% 
+  head()
+```
+## Correspondence Analysis
+I make sure to read up on the CA algorithm before continuing. If I read the Wikipedia article right, it goes like this:
+
+1. Divide row and column sums of 2-way contingency table by total sums.
+
+2. Create diagonal matrix from inverse of square roots of these vectors.
+
+\[
+  \begin{aligned}
+    & W_m = \text{diag}(1/ (\sqrt{w_m})\\
+    & W_n = \text{diag}(1/ \sqrt{w_n})
+  \end{aligned}
+\]
+
+3. Divide contingency table by sum of cells.
+
+4. Compute standardized residuals:
+
+\[S = W_M(P -w_mw_n)W_n \]
+
+where $P$ is the data matrix. This is
+the difference of the contingency table and the outer product of the marginal sums, with each cell scaled by its column and row sum. That outer product is actually just the expected frequencies matrix from the chi-squared test.
+
+Then singular value decomposition is applied
+
+\[S = U \Sigma V ^*\]
+
+The sum of the singular values in $\Sigma$ is also the total sum of squares. 
+
+As with PCA, each singular vector of the projection accounts for a share of total variance, higher being better. 
+Factor scores for the rows are derived by:
+
+\[F_m = W_mU \Sigma\]
+
+And for the columns:
+
+\[F_n = W_nV \Sigma\]
+
+The singular vectors of the dimension are scaled by the inverse square roots of its sums. This means distances in principal coordinates equal chi-square distances.
+
+In a nutshell, CA uses SVD of the expected frequencies of the contingency table, while PCA uses eigendecomposition of the covariance or correlation matrix.
+
+Multiple correspondence analysis conducts CA on an indicator matrix representing the level of each categorical variable to which each observation belongs
+
+## Cluster Analysis
+
+A PCA on only the numeric variables captures more than 97% of variance in three components. That is very good.
+```{r}
+ pca2 <- select(cleaned[train_i, -1], where(~!is.factor(.x))) %>% 
+  PCA(ncp = 3)
+
+head(pca2$var$coord)
+distance <- pca2$ind$coord %>% 
+get_dist(stand = TRUE, method = "canberra")
+```
+\pagebreak
+A distance visualization for the distances matrix of the components.
+```{r}
+fviz_dist(distance, show_labels = FALSE)
+```
+We have far too many numeric variables as is, so I take the first two principal component scores and use them to classify the observations hierarchically. I
+can use these clusterings to suggest a good number of clsuters for a `kmeans` clustering.
+[Some information](http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/117-hcpc-hierarchical-clustering-on-principal-components-essentials/) on the method.
+```{r}
+hcpc <- HCPC(pca2, method = "complete", metric = "manhattan", nb.clust = 0L, cluster.CA = "rows", graph = FALSE)
+```
+
+\pagebreak
+The HCPC suggests 3 clusters, but cluster 2 has low class homogeneity.
+```{r}
+as_tibble(hcpc$call$X, rownames = "obs") %>% 
+  arrange(as.numeric(obs)) %>% 
+  mutate(class = cleaned$CLASS_LABEL[train_i]) %>% 
+  ggplot(aes(x = Dim.1, y = Dim.2)) +
+  geom_jitter(aes(color = as.factor(clust), shape = class), alpha = .3) +
+  labs(color = "cluster")
+```
+We see many of the same variables are most distinctive within each cluster.
+```{r}
+hcpc$desc.var$quanti %>% map(as_tibble, rownames = "variable") %>% bind_rows(.id = "cluster") %>% group_by(cluster) %>% 
+  arrange(abs(-`Mean in category` - `Overall mean`))
+```
+\pagebreak
+I apply clustering analysis. Two clusters are well
+differentiated, but one is almost evenly split.
+```{r}
+table_clusters <- function(df, clust_vec, class_var){
+  class_var <- substitute(class_var)
+df %>% mutate(cluster = as.factor(clust_vec)) %>% 
+  group_by(cluster) %>%
+  group_modify(~fct_count(.x[[as.character(class_var)]], prop = TRUE))
+}
+clust <- kmeans(famd$ind$coord, nstart = 5, centers = 3)
+
+table_clusters(cleaned[train_i,], clust$cluster, CLASS_LABEL)
+```
+Using the principal components for clustering does pretty terribly, however.
+```{r}
+pc_clust <- kmeans(pca2$ind$coord, nstart = 5, centers = 3)
+table_clusters(cleaned[train_i,], pc_clust$cluster, CLASS_LABEL)
+```
+
+## Prediction
+
+Following [this approach](https://towardsdatascience.com/cluster-then-predict-for-classification-tasks-142fdfdc87d6), I conduct k-means clustering for two clusters, split the dataset by cluster, then apply a cross-validated lasso regression to each subset to predict whether the link is legitimate. 
+
+This requires me to create the model matrix to represent categorical variables,
+which makes interpretation more difficult but does not impact accuracy.
+```{r, message=FALSE}
+
+library(glmnet)
+
+train <- cleaned[train_i,]
+test <- cleaned[-train_i,]
+
+ train_cv <- train %>% split(kmeans(famd$ind$coord, nstart = 5, centers = 2)$cluster) %>% 
+   map(~select(.x, where(~!is.factor(.x) || n_distinct(.x) >1), -id)) %>% 
+  map( ~list(data = .x, mat = model.matrix( ~., .x[, -ncol(.x)]))) %>% 
+   map(~cv.glmnet(.x$mat, .x$data$CLASS_LABEL, type.measure = "deviance", family = "binomial" ))
+```
+\pagebreak
+In a binomial model , a one-unit increase in $\beta_i$ increases the odds by
+a factor of $e^{\beta_i}$.
+
+Cluster 1 is predominantly phishing, cluster 2 predominantly not. In each case the most prominent coefficient is that for the presence of an IP address.
+```{r}
+train_cv %>% map(~broom::tidy(.x$glmnet.fit) %>% group_by(term) %>%
+  filter(lambda == .x$lambda.min) %>%
+  slice_max(order_by = abs(estimate), n = 1) %>%
+  ungroup() %>%
+  arrange(-abs(estimate)) %>% 
+    head() %>% 
+    knitr::kable())
+```
+
+```{r}
+FAMD_test <- FAMD(mutate(test, across(where(is.numeric), scale)), sup.var = 50, graph = FALSE)
+test_clust <- kmeans(FAMD_test$ind$coord, centers = 2, nstart = 5)$cluster
+
+test_dat <- test %>% split(test_clust) %>% 
+  map(~select(.x, where(~!is.factor(.x) || n_distinct(.x) >1), -id)) %>% 
+  map( ~list(data = .x, mat = model.matrix( ~., .x[, -ncol(.x)])))
+```
+
+\pagebreak
+Finally, I fit the model to the test data.
+```{r}
+test_fit <- map2(train_cv, test_dat, ~predict(.x, newx = .y$mat, type = "class", s = .x$lambda.min))
+```
+
+Here's the confusion matrix. Overall accuracy is about 90%. Since the class split is
+even, I'd say this model worked pretty well.
+```{r}
+CM <- table(test$CLASS_LABEL, unsplit(test_fit, test_clust))
+knitr::kable(CM)
+knitr::kable(CM / colSums(CM))
+```
